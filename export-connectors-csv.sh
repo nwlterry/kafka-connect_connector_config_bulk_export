@@ -48,49 +48,41 @@ echo ""
 row_count=0
 
 for name in "${connectors[@]}"; do
+    if [ -z "$name" ]; then
+        echo "SKIP: empty connector name detected"
+        continue
+    fi
+
     echo ""
-    echo "──────────────────────────────────────────────"
-    echo "Processing connector: →${name}←"
+    echo "Processing: [$connector_count] →${name}← (length: ${#name})"
 
-    # URL-encode name (handles spaces, :, etc.)
-    encoded_name=$(printf '%s' "$name" | jq -s -R @uri)
+    # Very conservative filename
+    safe_name=$(echo -n "$name" | tr -cd '[:alnum:]_.-' | head -c 100)
+    if [ -z "$safe_name" ]; then
+        safe_name="connector_${connector_count}"
+    fi
 
+    raw_file="$DEBUG_DIR/${safe_name}_response.json"
+    err_file="$DEBUG_DIR/${safe_name}_curl.err"
+
+    echo "  → Writing to: $raw_file"
+
+    # Quote URL carefully + encode name
+    encoded_name=$(printf '%s' "$name" | jq -sRr @uri 2>/dev/null || echo "$name")
     url="${HOST}/connectors/${encoded_name}?expand=status,info"
-    echo "  Requesting: $url"
 
-    raw_file="$DEBUG_DIR/$(echo "$name" | tr -C '[:alnum:]-' '_')_response.json"
-    err_file="$DEBUG_DIR/$(echo "$name" | tr -C '[:alnum:]-' '_')_error.txt"
-
-    # Fetch with verbose logging
-    curl -s -f ${INSECURE} -u "${CONNECT_USER}:${CONNECT_PASS}" "$url" \
+    # Run curl
+    curl ${INSECURE} -s -f -u "${CONNECT_USER}:${CONNECT_PASS}" "$url" \
         > "$raw_file" 2> "$err_file"
 
-    curl_exit=$?
+    curl_rc=$?
+    echo "  → curl return code = $curl_rc"
 
-    echo "  curl exit code: $curl_exit"
+    ls -l "$raw_file" "$err_file" 2>/dev/null || echo "  → No files created!"
 
-    if [ $curl_exit -ne 0 ]; then
-        echo "  → curl FAILED"
-        echo "  Error output:"
-        cat "$err_file"
-        echo "  (full curl command for manual test:)"
-        echo "  curl -v ${INSECURE} -u \"${CONNECT_USER}:<pass>\" \"$url\""
-        continue
-    fi
-
-    if [ ! -s "$raw_file" ]; then
-        echo "  → Response file is empty"
-        continue
-    fi
-
-    echo "  Response saved: $raw_file"
-    echo "  First 200 chars of response:"
-    head -c 200 "$raw_file" | cat -vet
-    echo ""
-
-    # Try to parse
-    if ! jq . "$raw_file" > /dev/null 2>&1; then
-        echo "  → Not valid JSON"
+    if [ $curl_rc -ne 0 ]; then
+        echo "  → curl failed - see $err_file"
+        cat "$err_file" 2>/dev/null || echo "  (err file empty or missing)"
         continue
     fi
 
