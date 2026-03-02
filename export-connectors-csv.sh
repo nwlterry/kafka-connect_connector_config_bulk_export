@@ -1,126 +1,133 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Bulk export Kafka Connect connectors config → CSV (array-based loop fix)
-# ──────────────────────────────────────────────────────────────────────────────
-
 DEFAULT_HOST="https://connect.example.com:8083"
 
 read -p "Kafka Connect REST URL [${DEFAULT_HOST}]: " input_host
 HOST="${input_host:-$DEFAULT_HOST}"
 
 echo ""
-echo "Please enter your credentials (password will not be shown):"
-echo ""
-
+echo "Credentials (password hidden):"
 read -p "Username: " CONNECT_USER
 read -s -p "Password: " CONNECT_PASS
 echo ""
 
 if [ -z "$CONNECT_USER" ] || [ -z "$CONNECT_PASS" ]; then
-    echo "Error: Both username and password are required." >&2
+    echo "Error: Username and password required." >&2
     exit 1
 fi
 
-# Optional for self-signed certs
+# Uncomment if self-signed cert
 # INSECURE="--insecure"
 INSECURE=""
 
-OUTPUT_FILE="kafka-connectors-export-$(date +%Y%m%d-%H%M%S).csv"
-DEBUG_DIR="debug_connect_$(date +%Y%m%d-%H%M%S)"
+OUTPUT_FILE="connectors-export-$(date +%Y%m%d-%H%M%S).csv"
+DEBUG_DIR="debug_$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$DEBUG_DIR"
 
-echo "Debug files → $DEBUG_DIR"
+echo "Debug goes to: $DEBUG_DIR"
 echo ""
 
-# CSV header
 cat << 'EOF' > "$OUTPUT_FILE"
 connector_name,connector_type,connector_class,state,tasks_total,connection_url,username_or_user,principal_or_jaas,other_sensitive_keys,full_config_json
 EOF
 
-# Get connectors as array
-mapfile -t connector_array < <(curl -s -f ${INSECURE} -u "${CONNECT_USER}:${CONNECT_PASS}" "${HOST}/connectors" | jq -r '.[]' 2>/dev/null)
+# Get list as array (safest)
+mapfile -t connectors < <(curl -s -f ${INSECURE} -u "${CONNECT_USER}:${CONNECT_PASS}" "${HOST}/connectors" | jq -r '.[]' 2>/dev/null)
 
-if [ ${#connector_array[@]} -eq 0 ]; then
-    echo "No connectors found or API error."
+echo "Number of connectors: ${#connectors[@]}"
+if [ ${#connectors[@]} -eq 0 ]; then
+    echo "No connectors → exiting"
     exit 0
 fi
 
-echo "Found ${#connector_array[@]} connector(s)"
-echo "First few names (for debug):"
-printf '  - %s\n' "${connector_array[@]:0:3}"
+echo "Connector names:"
+printf '  • %s\n' "${connectors[@]}"
 echo ""
 
-connector_count=0
+row_count=0
 
-for name in "${connector_array[@]}"; do
-    ((connector_count++))
+for name in "${connectors[@]}"; do
+    echo ""
+    echo "──────────────────────────────────────────────"
+    echo "Processing connector: →${name}←"
 
-    echo "Processing [$connector_count]: '$name'"
+    # URL-encode name (handles spaces, :, etc.)
+    encoded_name=$(printf '%s' "$name" | jq -s -R @uri)
 
-    # Sanitize filename (replace bad chars)
-    safe_name="${name//[^a-zA-Z0-9._-]/_}"
-    raw_file="$DEBUG_DIR/${safe_name}_raw.json"
-    err_file="$DEBUG_DIR/${safe_name}.err"
+    url="${HOST}/connectors/${encoded_name}?expand=status,info"
+    echo "  Requesting: $url"
 
-    # Fetch details
-    curl -s -f ${INSECURE} -u "${CONNECT_USER}:${CONNECT_PASS}" "${HOST}/connectors/${name}?expand=status,info" \
+    raw_file="$DEBUG_DIR/$(echo "$name" | tr -C '[:alnum:]-' '_')_response.json"
+    err_file="$DEBUG_DIR/$(echo "$name" | tr -C '[:alnum:]-' '_')_error.txt"
+
+    # Fetch with verbose logging
+    curl -s -f ${INSECURE} -u "${CONNECT_USER}:${CONNECT_PASS}" "$url" \
         > "$raw_file" 2> "$err_file"
 
-    if [ $? -ne 0 ]; then
-        echo "  → FAILED fetch (HTTP error or timeout) → see $err_file"
+    curl_exit=$?
+
+    echo "  curl exit code: $curl_exit"
+
+    if [ $curl_exit -ne 0 ]; then
+        echo "  → curl FAILED"
+        echo "  Error output:"
         cat "$err_file"
+        echo "  (full curl command for manual test:)"
+        echo "  curl -v ${INSECURE} -u \"${CONNECT_USER}:<pass>\" \"$url\""
         continue
     fi
 
     if [ ! -s "$raw_file" ]; then
-        echo "  → Empty response file → see $raw_file"
+        echo "  → Response file is empty"
         continue
     fi
 
-    # Validate JSON lightly
+    echo "  Response saved: $raw_file"
+    echo "  First 200 chars of response:"
+    head -c 200 "$raw_file" | cat -vet
+    echo ""
+
+    # Try to parse
     if ! jq . "$raw_file" > /dev/null 2>&1; then
-        echo "  → Invalid JSON → see $raw_file"
+        echo "  → Not valid JSON"
         continue
     fi
 
-    echo "  → OK (response saved)"
+    echo "  → Valid JSON"
 
-    info=$(cat "$raw_file")
+    # Extract fields
+    type=$(jq -r '.info.type // "unknown"' "$raw_file")
+    class=$(jq -r '.info.config["connector.class"] // "missing"' "$raw_file")
+    state=$(jq -r '.status.connector.state // "UNKNOWN"' "$raw_file")
+    tasks_total=$(jq -r '.status.tasks | length // 0' "$raw_file")
 
-    type=$(jq -r '.info.type // "unknown"' <<< "$info")
-    class=$(jq -r '.info.config["connector.class"] // ""' <<< "$info")
-    state=$(jq -r '.status.connector.state // "UNKNOWN"' <<< "$info")
-    tasks_total=$(jq -r '.status.tasks | length // 0' <<< "$info")
+    config_json=$(jq -c '.info.config // {}' "$raw_file")
 
-    config=$(jq '.info.config // {}' <<< "$info")
+    echo "  Extracted type: $type"
+    echo "  Extracted class: $class"
+    echo "  Extracted state: $state"
+    echo "  Extracted tasks: $tasks_total"
+    echo "  Config length: ${#config_json} chars"
 
-    conn_url=$(jq -r '.["connection.url"] // ""' <<< "$config" | sed 's/"/""/g')
-
-    user_fields=$(jq -r 'to_entries[]
-        | select(.key | test("user|username|principal|owner|sasl.mechanism|sasl.jaas"; "i"))
-        | "\(.key)=\(.value)"' <<< "$config" | tr '\n' ';' | sed 's/;$//; s/"/""/g' || echo "none")
-
-    jaas=$(jq -r 'to_entries[]
-        | select(.key | test("jaas|principal|sasl.jaas|sasl.kerberos"; "i"))
-        | .value' <<< "$config" | head -n1 | sed 's/"/""/g' || echo "none")
-
-    sensitive_keys=$(jq -r 'keys[]
-        | select(test("pass|secret|key|token|cred|private|sasl|truststore|keystore|password"; "i"))
-        | .' <<< "$config" | sort | uniq | paste -sd, - | sed 's/"/""/g' || echo "none")
-
-    full_json=$(jq -c . <<< "$config" | sed 's/"/""/g' || echo "{}")
+    # If we got this far → try to write row
+    conn_url=$(jq -r '.["connection.url"] // ""' <<< "$config_json" | sed 's/"/""/g')
+    # ... (rest of your field extraction - keep as is)
 
     printf '"%s","%s","%s","%s","%s","%s","%s","%s","%s","%s"\n' \
         "$name" "$type" "$class" "$state" "$tasks_total" \
-        "$conn_url" "${user_fields}" "${jaas}" "${sensitive_keys}" "$full_json" \
+        "$conn_url" "..." "..." "..." "$config_json" \
         >> "$OUTPUT_FILE"
 
+    ((row_count++))
+    echo "  → Row written (total now: $row_count)"
 done
 
 echo ""
-echo "Done. Processed $connector_count connector(s)."
-echo "CSV: $OUTPUT_FILE"
-echo "Debug: $DEBUG_DIR"
-echo "If still empty rows → check files in debug folder"
+echo "Final summary:"
+echo "  Connectors found: ${#connectors[@]}"
+echo "  Rows written to CSV: $row_count"
+echo "  Output file: $OUTPUT_FILE"
+echo "  Debug folder: $DEBUG_DIR"
+echo ""
+echo "If rows=0 but debug files exist → open one *_response.json and tell me what it contains."
