@@ -37,7 +37,7 @@ connector_name,connector_type,connector_class,state,tasks_total,connection_url,u
 EOF
 
 # Fetch connectors list with verbose on error
-connectors_output=$(curl -s -f -v ${INSECURE} -u "${USERNAME}:" "${HOST}/connectors" 2>&1) || {
+connectors_output=$(curl -s -f -v ${INSECURE} -u "${USERNAME}" "${HOST}/connectors" 2>&1) || {
   echo ""
   echo "┌────────────────────────────────────────────────────────────┐"
   echo "│               AUTHENTICATION / CONNECTION FAILED           │"
