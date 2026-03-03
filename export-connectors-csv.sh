@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# set -euo pipefail   # COMMENT OUT -e to avoid early exit on curl failure
+set -uo pipefail
+
+# =============================================================================
+# Export Kafka Connect connector information (non-sensitive fields only)
+# Continues on failure for individual connectors
+# =============================================================================
 
 DEFAULT_HOST="https://localhost:8083"
 
@@ -21,7 +27,7 @@ INSECURE=""   # "--insecure" if needed
 OUTPUT_FILE="connectors-user-info-$(date +%Y%m%d-%H%M%S).csv"
 
 cat << 'EOF' > "$OUTPUT_FILE"
-connector_name,connector_class,connection_url,username_or_user,principal_or_jaas,http_status,raw_config_length,notes
+connector_name,connector_class,connection_url,username_or_user,principal_or_jaas,http_status,notes
 EOF
 
 echo "Fetching list..."
@@ -51,58 +57,46 @@ for name in "${connectors[@]}"; do
 
     echo "  URL: $config_url"
 
-    config_raw=$(curl -s -f ${INSECURE} -u "${CONNECT_USER}:${CONNECT_PASS}" "$config_url" 2>/tmp/fetch_err.txt)
+    config_raw=$(curl -s ${INSECURE} -u "${CONNECT_USER}:${CONNECT_PASS}" "$config_url" 2>/tmp/fetch_err_${name//[^a-zA-Z0-9]/_}.txt)
+    curl_exit=$?
 
-    http_status=$(echo "$config_raw" | tail -n1 || echo "unknown")
-    body=$(echo "$config_raw" | sed '$d' || echo "")
-
-    if [ $? -ne 0 ] || [ "$http_status" != "200" ]; then
-        echo "  → FAILED (status $http_status)"
-        cat /tmp/fetch_err.txt
-        printf '"%s","failed","none","none","none","%s","0","fetch_failed"\n' "$name" "$http_status" >> "$OUTPUT_FILE"
+    if [ $curl_exit -ne 0 ]; then
+        echo "  → curl failed (exit code $curl_exit)"
+        cat /tmp/fetch_err_${name//[^a-zA-Z0-9]/_}.txt
+        printf '"%s","failed","none","none","none","failed","curl_error_%s"\n' "$name" "$curl_exit" >> "$OUTPUT_FILE"
         ((row_count++))
         continue
     fi
 
-    echo "  HTTP: $http_status   length: ${#body}"
+    # Get HTTP status from response (if -w was used, but here we use curl -I for simplicity)
+    http_status=$(curl -s -I ${INSECURE} -u "${CONNECT_USER}:${CONNECT_PASS}" "$config_url" | head -n1 | awk '{print $2}')
 
-    if [ -z "$body" ]; then
+    echo "  HTTP: $http_status   length: ${#config_raw}"
+
+    if [ -z "$config_raw" ]; then
         echo "  → empty body"
-        printf '"%s","missing","none","none","none","200","0","empty_response"\n' "$name" >> "$OUTPUT_FILE"
+        printf '"%s","missing","none","none","none","%s","empty_body"\n' "$name" "$http_status" >> "$OUTPUT_FILE"
         ((row_count++))
         continue
     fi
 
-    # Show first part for debug
-    echo "  First 200 chars:"
-    echo "$body" | head -c 200 | cat -vet
-    echo ""
+    connector_class=$(echo "$config_raw" | jq -r '."connector.class" // "missing"' 2>/dev/null || echo "parse_error")
+    conn_url=$(echo "$config_raw" | jq -r '."connection.url" // ""' | sed 's/"/""/g' 2>/dev/null || echo "parse_error")
 
-    connector_class=$(echo "$body" | jq -r '."connector.class" // "missing"')
-    conn_url=$(echo "$body" | jq -r '."connection.url" // ""' | sed 's/"/""/g')
-
-    # Very permissive user/principal collection (exclude obvious password keys)
-    user_info=$(echo "$body" | jq -r 'to_entries[]
+    user_info=$(echo "$config_raw" | jq -r 'to_entries[]
         | select(.key | test("user|username|principal|owner|sasl.mechanism"; "i"))
         | select(.key | test("password|pass|secret|key|cred|token|private"; "i") | not)
         | "\(.key)=\(.value)"' | tr '\n' ';' | sed 's/;$//; s/"/""/g' || echo "none")
 
     notes="ok"
-    if echo "$body" | grep -q '\*\*\*\*'; then
+    if echo "$config_raw" | grep -q '\*\*\*\*'; then
         notes="masked"
-    elif [ "$body" = "{}" ]; then
+    elif [ "$config_raw" = "{}" ]; then
         notes="empty_config"
     fi
 
-    printf '"%s","%s","%s","%s","%s","%s","%s","%s"\n' \
-        "$name" \
-        "$connector_class" \
-        "$conn_url" \
-        "$user_info" \
-        "—" \
-        "$http_status" \
-        "${#body}" \
-        "$notes" \
+    printf '"%s","%s","%s","%s","%s","%s","%s"\n' \
+        "$name" "$connector_class" "$conn_url" "$user_info" "—" "$http_status" "$notes" \
         >> "$OUTPUT_FILE"
 
     echo "  → row added"
@@ -115,5 +109,5 @@ echo "  Connectors listed : ${#connectors[@]}"
 echo "  Rows exported     : $row_count"
 echo "  CSV file          : $OUTPUT_FILE"
 echo ""
-echo "If most rows show 'empty_config' or 'none' → normal Confluent masking"
-echo "If only one row → only one connector has visible non-sensitive user fields"
+echo "Check /tmp/fetch_err_* files for connectors that failed"
+echo "Most likely cause: connector name has special characters, or permission denied on some connectors"
