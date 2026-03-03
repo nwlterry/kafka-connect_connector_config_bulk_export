@@ -3,7 +3,8 @@ set -uo pipefail
 
 # =============================================================================
 # Export Kafka Connect connector basic info to CSV
-# Only selected non-sensitive fields are included
+# Only selected non-sensitive fields
+# Cleans basic.auth.user.info → keeps only username (removes :password)
 # =============================================================================
 
 DEFAULT_HOST="https://localhost:8083"
@@ -21,7 +22,7 @@ echo ""
 
 [ -z "$CONNECT_USER" ] || [ -z "$CONNECT_PASS" ] && { echo "Missing credentials"; exit 1; }
 
-INSECURE=""   # set to "--insecure" if needed
+INSECURE=""   # "--insecure" if needed
 
 OUTPUT_FILE="connectors-basic-info-$(date +%Y%m%d-%H%M%S).csv"
 
@@ -75,7 +76,13 @@ for name in "${connectors[@]}"; do
 
     conn_url=$(echo "$config_raw" | jq -r '."connection.url" // ""' | sed 's/"/""/g' 2>/dev/null || echo "none")
 
-    basic_auth_user_info=$(echo "$config_raw" | jq -r '."basic.auth.user.info" // "none"' | sed 's/"/""/g' 2>/dev/null || echo "none")
+    # Extract basic.auth.user.info and remove password part
+    basic_auth_raw=$(echo "$config_raw" | jq -r '."basic.auth.user.info" // "none"' 2>/dev/null || echo "none")
+
+    # Keep only username (everything before first :)
+    basic_auth_user_info=$(echo "$basic_auth_raw" | sed 's/:.*$//' | sed 's/"/""/g' || echo "none")
+    # If no : was present, keep original value
+    [ "$basic_auth_user_info" = "$basic_auth_raw" ] && basic_auth_user_info=$(echo "$basic_auth_raw" | sed 's/"/""/g')
 
     connection_user=$(echo "$config_raw" | jq -r '
         ."connection.user" // 
@@ -111,11 +118,11 @@ echo "  Connectors processed : ${#connectors[@]}"
 echo "  Rows exported        : $row_count"
 echo "  Output file          : $OUTPUT_FILE"
 echo ""
-echo "Only requested fields exported:"
+echo "Fields exported:"
 echo "  • connector_name"
 echo "  • connector_class"
 echo "  • connection_url"
-echo "  • basic.auth.user.info"
+echo "  • basic.auth.user.info (password part removed)"
 echo "  • connection.user / user / username / db.user / db.username"
 echo "  • principal.service.name / principal / service.principal"
 echo ""
