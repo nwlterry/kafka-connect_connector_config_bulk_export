@@ -1,12 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =============================================================================
-# Bulk Export Kafka Connect Connectors Configuration to CSV
-# Uses /connectors/{name}/config for configuration
-# Fetches type/state/tasks from separate /connectors/{name} call
-# =============================================================================
-
 DEFAULT_HOST="https://localhost:8083"
 
 echo ""
@@ -22,7 +16,7 @@ echo ""
 
 [ -z "$CONNECT_USER" ] || [ -z "$CONNECT_PASS" ] && { echo "Username and password required"; exit 1; }
 
-# INSECURE="--insecure"   # uncomment for self-signed cert
+# INSECURE="--insecure"   # uncomment if needed
 INSECURE=""
 
 OUTPUT_FILE="connectors-export-$(date +%Y%m%d-%H%M%S).csv"
@@ -63,31 +57,37 @@ for name in "${connectors[@]}"; do
     encoded=$(printf '%s' "$name" | jq -sRr @uri 2>/dev/null || echo "$name")
 
     config_url="${HOST}/connectors/${encoded}/config"
-    info_url="${HOST}/connectors/${encoded}?expand=status"
 
     config_file="$DEBUG_DIR/${safe_name}_config.json"
-    info_file="$DEBUG_DIR/${safe_name}_info.json"
     err_file="$DEBUG_DIR/${safe_name}_err.txt"
+    status_file="$DEBUG_DIR/${safe_name}_http.txt"
 
-    # 1. Get config
-    curl ${INSECURE} -s -w "\n%{http_code}" -u "${CONNECT_USER}:${CONNECT_PASS}" "$config_url" \
+    # Fetch config with fail-on-error + status code
+    curl ${INSECURE} -f -s -w "\n%{http_code}" -u "${CONNECT_USER}:${CONNECT_PASS}" "$config_url" \
         > "$config_file" 2> "$err_file"
 
     config_http=$(tail -n1 "$config_file")
     config_body=$(sed '$d' "$config_file")
+    echo "$config_http" > "$status_file"
 
-    # 2. Get type/state/tasks
-    curl ${INSECURE} -s -u "${CONNECT_USER}:${CONNECT_PASS}" "$info_url" > "$info_file" 2>> "$err_file"
-
-    echo "Config HTTP: $config_http"
+    echo "HTTP: $config_http   → $config_url"
 
     if [ "$config_http" != "200" ]; then
-        echo "  → Config fetch failed"
-        cat "$err_file"
+        echo "  → FAILED (HTTP $config_http)"
+        echo "  Error output:"
+        cat "$err_file" || echo "(err file empty)"
         continue
     fi
 
-    # Extract fields
+    if [ -z "$config_body" ]; then
+        echo "  → Empty response body"
+        continue
+    fi
+
+    echo "  Response first 300 chars:"
+    echo "$config_body" | head -c 300 | cat -vet || echo "(empty)"
+    echo ""
+
     connector_class=$(echo "$config_body" | jq -r '."connector.class" // "missing"')
     conn_url=$(echo "$config_body" | jq -r '."connection.url" // ""' | sed 's/"/""/g')
 
@@ -105,30 +105,24 @@ for name in "${connectors[@]}"; do
 
     full_json=$(echo "$config_body" | jq -c . | sed 's/"/""/g' || echo "{}")
 
-    # Status fields from info endpoint
-    type=$(echo "$(cat "$info_file")" | jq -r '.info.type // "unknown"')
-    state=$(echo "$(cat "$info_file")" | jq -r '.status.connector.state // "UNKNOWN"')
-    tasks_total=$(echo "$(cat "$info_file")" | jq -r '.status.tasks | length // 0')
-
     notes=""
     if echo "$full_json" | grep -q '\*\*\*\*'; then
-        notes="CONTAINS_MASKED_FIELDS"
+        notes="MASKED_FIELDS_PRESENT"
     elif [ "$full_json" = "{}" ]; then
         notes="CONFIG_EMPTY"
     fi
 
+    # Status from separate call
+    info_url="${HOST}/connectors/${encoded}?expand=status"
+    info_raw=$(curl ${INSECURE} -s -u "${CONNECT_USER}:${CONNECT_PASS}" "$info_url" 2>/dev/null)
+
+    type=$(echo "$info_raw" | jq -r '.info.type // "unknown"')
+    state=$(echo "$info_raw" | jq -r '.status.connector.state // "UNKNOWN"')
+    tasks_total=$(echo "$info_raw" | jq -r '.status.tasks | length // 0')
+
     printf '"%s","%s","%s","%s","%s","%s","%s","%s","%s","%s","%s"\n' \
-        "$name" \
-        "$type" \
-        "$connector_class" \
-        "$state" \
-        "$tasks_total" \
-        "$conn_url" \
-        "${user_fields}" \
-        "${jaas}" \
-        "${sensitive_keys}" \
-        "$full_json" \
-        "$notes" \
+        "$name" "$type" "$connector_class" "$state" "$tasks_total" \
+        "$conn_url" "${user_fields}" "${jaas}" "${sensitive_keys}" "$full_json" "$notes" \
         >> "$OUTPUT_FILE"
 
     echo "  → Row written"
@@ -137,9 +131,8 @@ done
 echo ""
 echo "Summary:"
 echo "  Connectors: ${#connectors[@]}"
-echo "  Rows in CSV: $row_count"
-echo "  File: $OUTPUT_FILE"
+echo "  Rows: $row_count"
+echo "  CSV: $OUTPUT_FILE"
 echo "  Debug: $DEBUG_DIR"
 echo ""
-echo "If most configs are empty/masked → normal Confluent Platform behavior"
-echo "Secrets are intentionally hidden in REST API responses since Kafka Connect 2.6+"
+echo "If rows=0 → check HTTP codes in *_http.txt files and *_err.txt files"
