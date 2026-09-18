@@ -1,27 +1,21 @@
 # kafka-connect_connector_config_bulk_export
 
-Exports selected non-secret Kafka Connect connector config fields to CSV via the Connect REST API.
+Export selected non-secret Kafka Connect connector config fields to CSV via the Connect REST API.
 
-## Script
+## Layout
 
-`export-connectors-csv.sh`
-
-```bash
-bash export-connectors-csv.sh
+```
+scripts/export-connectors-csv.sh
+GROUP.md
+README.md
 ```
 
-Prompts for:
+```bash
+bash scripts/export-connectors-csv.sh
+```
 
-- Connect REST URL (default `https://localhost:8083`)
-- Username and password
+Prompts for Connect REST URL (default `https://localhost:8083`) and credentials. Writes `connectors-basic-info-YYYYMMDD-HHMMSS.csv`. Passwords after the first `:` in `basic.auth.user.info` are stripped. Requires `curl` and `jq`.
 
-Writes `connectors-basic-info-YYYYMMDD-HHMMSS.csv` with:
+---
 
-- `connector_name`
-- `connector_class`
-- `connection_url`
-- `basic.auth.user.info` (password after the first `:` is stripped)
-- `connection.user` / `user` / `username` / `db.user` / `db.username`
-- `principal.service.name` / `principal` / `service.principal`
-
-Passwords, tokens, and keys are not exported. Requires `curl` and `jq`.
+See [GROUP.md](GROUP.md) for sibling repositories. Catalog: https://github.com/nwlterry/nwlterry
